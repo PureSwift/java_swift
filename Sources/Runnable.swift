@@ -48,10 +48,12 @@ fileprivate class RunnableLocal_: JNILocalProxy<Runnable, Any> {
 
         natives.append( JNINativeMethod( name: strdup("__finalize"), signature: strdup("(J)V"), fnPtr: unsafeBitCast( JNIReleasableProxy__finalize_thunk, to: UnsafeMutableRawPointer.self ) ) )
 
+        let nativesCount = natives.count
+
         let clazz = JNI.FindClass( proxyClassName() )
         natives.withUnsafeBufferPointer {
             nativesPtr in
-            if JNI.api.RegisterNatives( JNI.env, clazz, nativesPtr.baseAddress, jint(nativesPtr.count) ) != jint(JNI_OK) {
+            if JNI.api.RegisterNatives( JNI.env, clazz, nativesPtr.baseAddress, jint(nativesCount) ) != jint(JNI_OK) {
                 JNI.report( "Unable to register java natives" )
             }
         }

@@ -21,10 +21,22 @@ public func JNI_OnLoad( jvm: UnsafeMutablePointer<JavaVM?>, ptr: UnsafeRawPointe
     JNI.jvm = jvm
     let env: UnsafeMutablePointer<JNIEnv?>? = JNI.GetEnv()
     JNI.api = env!.pointee!.pointee
-    if pthread_setspecific( JNICore.envVarKey, env ) != 0 {
-        JNI.report( "Could not set pthread specific GetEnv()" )
-    }
 
+    var result = withUnsafeMutablePointer(to: &jniEnvKey, {
+        pthread_key_create($0, JNI_DetachCurrentThread)
+    })
+    if (result != 0) {
+        fatalError("Can't pthread_key_create")
+    }
+    pthread_setspecific(jniEnvKey, env)
+
+    result = withUnsafeMutablePointer(to: &jniFatalMessage, {
+        pthread_key_create($0, JNI_RemoveFatalMessage)
+    })
+    if (result != 0) {
+        fatalError("Can't pthread_key_create")
+    }
+    
     // Save ContextClassLoader for FindClass usage
     // When a thread is attached to the VM, the context class loader is the bootstrap loader.
     // https://docs.oracle.com/javase/1.5.0/docs/guide/jni/spec/invocation.html
@@ -34,11 +46,31 @@ public func JNI_OnLoad( jvm: UnsafeMutablePointer<JavaVM?>, ptr: UnsafeRawPointe
     return jint(JNI_VERSION_1_6)
 }
 
-public func JNI_DetachCurrentThread() {
+fileprivate class FatalErrorMessage {
+    let description: String
+    let file: String
+    let line: Int
+
+    init(description: String, file: String, line: Int) {
+        self.description = description
+        self.file = file
+        self.line = line
+    }
+}
+
+public func JNI_DetachCurrentThread(_ ptr: UnsafeMutableRawPointer?) {
     _ = JNI.jvm?.pointee?.pointee.DetachCurrentThread( JNI.jvm )
 }
 
+public func JNI_RemoveFatalMessage(_ ptr: UnsafeMutableRawPointer?) {
+    if let ptr = ptr {
+        Unmanaged<FatalErrorMessage>.fromOpaque(ptr).release()
+    }
+}
+
 public let JNI = JNICore()
+fileprivate var jniEnvKey = pthread_key_t()
+fileprivate var jniFatalMessage = pthread_key_t()
 
 open class JNICore {
 
@@ -46,24 +78,20 @@ open class JNICore {
     open var api: JNINativeInterface_!
     open var classLoader: jobject?
 
-    static var envVarKey: pthread_key_t = {
-        var envVarKey: pthread_key_t = 0
-        if pthread_key_create( &envVarKey, { _ in
-            _ = JNI.jvm?.pointee?.pointee.DetachCurrentThread( JNI.jvm )
-        }) != 0 {
-            JNI.report( "Could not create pthread envVarKey" )
-        }
-        return envVarKey
-    }()
+    open var threadKey: pid_t { return gettid() }
+
+    open var errorLogger: (_ message: String) -> Void = { message in
+        NSLog(message)
+    }
 
     open var env: UnsafeMutablePointer<JNIEnv?>? {
-        if let existing = pthread_getspecific( JNICore.envVarKey ) {
-            return existing.assumingMemoryBound(to: JNIEnv?.self)
+        if let env: UnsafeMutableRawPointer = pthread_getspecific(jniEnvKey) {
+            return env.assumingMemoryBound(to: JNIEnv?.self)
         }
-
         let env = AttachCurrentThread()
-        if pthread_setspecific( JNICore.envVarKey, env ) != 0 {
-            JNI.report( "Could not set pthread specific env" )
+        let error = pthread_setspecific(jniEnvKey, env)
+        if error != 0 {
+            NSLog("Can't save env to pthread_setspecific")
         }
         return env
     }
@@ -79,9 +107,14 @@ open class JNICore {
     }
 
     open func report( _ msg: String, _ file: StaticString = #file, _ line: Int = #line ) {
-        NSLog( "\(msg) - at \(file):\(line)" )
-        if api?.ExceptionCheck( env ) != 0 {
-            api.ExceptionDescribe( env )
+        errorLogger( "\(msg) - at \(file):\(line)" )
+        if let throwable: jthrowable = ExceptionCheck() {
+            let throwable = Throwable(javaObject: throwable)
+            let className = throwable.className()
+            let message = throwable.getMessage()
+            let stackTrace = throwable.stackTraceString()
+            errorLogger("\(className): \(message ?? "unavailable")\(stackTrace)")
+            throwable.printStackTrace()
         }
     }
 
@@ -262,7 +295,7 @@ open class JNICore {
         }
     }
 
-    private var thrownCache = [pthread_t: jthrowable]()
+    private var thrownCache = [pid_t: jthrowable]()
     private let thrownLock = NSLock()
 
     open func check<T>( _ result: T, _ locals: UnsafeMutablePointer<[jobject]>, removeLast: Bool = false, _ file: StaticString = #file, _ line: Int = #line ) -> T {
@@ -272,18 +305,19 @@ open class JNICore {
         for local in locals.pointee {
             DeleteLocalRef( local )
         }
-        if api.ExceptionCheck( env ) != 0, let throwable: jthrowable = api.ExceptionOccurred( env ) {
-            report( "Exception occured", file, line )
-            thrownLock.lock()
-            thrownCache[pthread_self()] = throwable
-            thrownLock.unlock()
-            api.ExceptionClear( env )
+        if api.ExceptionCheck( env ) != 0 {
+            if let throwable: jthrowable = api.ExceptionOccurred( env ) {
+                thrownLock.lock()
+                thrownCache[threadKey] = throwable
+                thrownLock.unlock()
+                api.ExceptionClear(env)
+            }
         }
         return result
     }
 
     open func ExceptionCheck() -> jthrowable? {
-        let currentThread: pthread_t = pthread_self()
+        let currentThread: pid_t = threadKey
         if let throwable: jthrowable = thrownCache[currentThread] {
             thrownLock.lock()
             thrownCache.removeValue(forKey: currentThread)
@@ -295,9 +329,35 @@ open class JNICore {
 
     open func ExceptionReset() {
         if let throwable: jthrowable = ExceptionCheck() {
-            report( "Left over exception" )
-            Throwable( javaObject: throwable ).printStackTrace()
+            errorLogger( "Left over exception" )
+            let throwable = Throwable(javaObject: throwable)
+            let className = throwable.className()
+            let message = throwable.getMessage()
+            let stackTrace = throwable.stackTraceString()
+            errorLogger("\(className): \(message ?? "unavailable")\(stackTrace)")
+            throwable.printStackTrace()
         }
+    }
+
+    open func SaveFatalErrorMessage(_ msg: String, _ file: StaticString = #file, _ line: Int = #line) {
+        let fatalError = FatalErrorMessage(description: msg, file: file.description, line: line)
+        let ptr = Unmanaged.passRetained(fatalError).toOpaque()
+        let error = pthread_setspecific(jniFatalMessage, ptr)
+        if error != 0 {
+            errorLogger("Can't save fatal message to pthread_setspecific")
+        }
+    }
+
+    open func RemoveFatalErrorMessage() {
+        pthread_setspecific(jniFatalMessage, nil)
+    }
+
+    open func GetFatalErrorMessage() -> String? {
+        guard let ptr: UnsafeMutableRawPointer = pthread_getspecific(jniFatalMessage) else {
+            return nil
+        }
+        let fatalErrorMessage = Unmanaged<FatalErrorMessage>.fromOpaque(ptr).takeUnretainedValue()
+        return "\(fatalErrorMessage.description) at \(fatalErrorMessage.file):\(fatalErrorMessage.line)"
     }
 
 }

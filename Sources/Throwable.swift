@@ -301,5 +301,39 @@ open class Throwable: JavaObject, /* interface java.io.Serializable */ Unavailab
 
     /// private synchronized void java.lang.Throwable.writeObject(java.io.ObjectOutputStream) throws java.io.IOException
 
+    private static var classGetNameMethod: jmethodID?
+
+    public func className() -> String {
+        let cls = JNI.api.GetObjectClass(JNI.env, javaObject)
+        var __locals = [jobject]()
+        var __args = [jvalue]( repeating: jvalue(), count: 1 )
+        __args[0] = jvalue(l: cls)
+        let javaClassName = JNIMethod.CallObjectMethod(object: cls, methodName: "getName", methodSig: "()Ljava/lang/String;", methodCache: &Throwable.classGetNameMethod, args: &__args, locals: &__locals)
+        let className = String(javaObject: javaClassName)
+        JNI.DeleteLocalRef(cls)
+        JNI.DeleteLocalRef(javaClassName)
+        return className
+    }
+
+    public func stackTraceString() -> String {
+        var stackTrace = ""
+        if let stackTraces = getStackTrace() {
+            for trace in stackTraces {
+                if let traceString = trace.toString() {
+                    stackTrace += "\n\(traceString)"
+                }
+            }
+        }
+        stackTrace += "\n"
+        return stackTrace
+    }
+
+    public func lastStackTraceString() -> String? {
+        guard let stackTraces = getStackTrace(), let firstTrace = stackTraces.first else {
+            return nil
+        }
+        return firstTrace.toString()
+    }
+
 }
 

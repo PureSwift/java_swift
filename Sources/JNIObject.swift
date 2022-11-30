@@ -114,8 +114,8 @@ open class JNIObjectForward: JNIObject {
 extension String: JNIObjectProtocol {
 
     public func localJavaObject( _ locals: UnsafeMutablePointer<[jobject]> ) -> jobject? {
-        if let javaObject: jstring =  Array(utf16).withUnsafeBufferPointer( {
-            JNI.env?.pointee?.pointee.NewString( JNI.env, $0.baseAddress, jsize($0.count) )
+        if let javaObject: jstring =  self.withCString( { ptr in
+            JNI.env?.pointee?.pointee.NewStringUTF( JNI.env, ptr )
         } ) {
             locals.pointee.append( javaObject )
             return javaObject
